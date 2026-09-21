@@ -2,8 +2,7 @@
 
 This repository connects the **MolmoAct2-DROID** vision-language-action model to a Franka robot equipped with a Robotiq 2F-85 gripper and two ZED cameras. The model runs behind an HTTP inference server; the robot controller captures observations, requests an action trajectory, validates it, and executes a configurable part of the trajectory in a closed loop.
 
-> [!WARNING]
-> This project controls physical robot hardware. Keep the Franka user-stop within reach, clear the workspace, verify the configured joint limits and speeds, and test carefully before enabling motion. MolmoAct2 output is nondeterministic and can be unsafe.
+
 
 ## System overview
 
