@@ -1,0 +1,39 @@
+experiment:
+  name: baseline
+  root_dir: experiments
+
+task:
+  instruction: "pick up the red cube and place it on the purple plate"
+
+franka:
+  robot_ip: "192.168.103.1"
+
+  joint_lower_limit:
+    [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
+
+  joint_upper_limit:
+    [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+
+  max_joint_velocity: 0.25
+  max_joint_acceleration: 0.35
+  max_joint_jerk: 1.00
+
+  position_time_constant: 0.30
+  velocity_time_constant: 0.20
+
+molmo:
+  server_url: "http://127.0.0.1:8000/act"
+  max_vla_steps: 20
+  actions_per_chunk: 10
+  action_rate_hz: 15.0
+
+  max_model_waypoint_delta: 0.30
+  max_initial_target_offset: 0.35
+
+gripper:
+  enabled: true
+  speed: 50
+  force: 20
+
+runtime:
+  dry_run: false

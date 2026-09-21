@@ -1,0 +1,68 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments and generated package files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Robot experiments and generated media
+/robot/experiments/
+/debug_model_images/
+/cameras/frame.png
+/zed_frame.png
+*.mp4
+
+# Model weights, checkpoints, and ML run artifacts
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.tflite
+*.h5
+*.hdf5
+*.npy
+*.npz
+checkpoint/
+checkpoints/
+wandb/
+runs/
+outputs/
+
+# Local model and dataset caches
+.cache/
+huggingface/
+hf_cache/
+datasets/
+
+# Bundled/upstream MolmoAct2 repositories
+/model_server/official_molmoact2/
+/Molmoact-2/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# IDE and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
