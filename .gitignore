@@ -66,3 +66,6 @@ datasets/
 .vscode/
 .DS_Store
 Thumbs.db
+
+/iteration_16
+/iteration_17

@@ -25,17 +25,21 @@ from inference.molmo_client import MolmoActClient
 
 CONFIG_PATH = "config.yaml"
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
-    CONFIG = yaml.safe_load(config_file)
+with open(CONFIG_PATH, "r", encoding="utf-8") as file:
+    CONFIG = yaml.safe_load(file)
 
 EXPERIMENT_NAME = CONFIG["experiment"]["name"]
 EXPERIMENT_ROOT = CONFIG["experiment"]["root_dir"]
 INSTRUCTION = CONFIG["task"]["instruction"]
 
 ROBOT_IP = CONFIG["franka"]["robot_ip"]
+
 JOINT_LOWER_LIMIT = np.asarray(CONFIG["franka"]["joint_lower_limit"], dtype=np.float64)
 JOINT_UPPER_LIMIT = np.asarray(CONFIG["franka"]["joint_upper_limit"], dtype=np.float64)
-JOINT_VELOCITY_LIMIT = np.asarray(CONFIG["franka"]["joint_velocity_limit"], dtype=np.float64)
+
+MAX_JOINT_VELOCITY = np.full(7, float(CONFIG["franka"]["max_joint_velocity"]), dtype=np.float64)
+MAX_JOINT_ACCELERATION = np.full(7, float(CONFIG["franka"]["max_joint_acceleration"]), dtype=np.float64)
+MAX_JOINT_JERK = np.full(7, float(CONFIG["franka"]["max_joint_jerk"]), dtype=np.float64)
 
 MOLMO_SERVER = CONFIG["molmo"]["server_url"]
 MAX_VLA_STEPS = int(CONFIG["molmo"]["max_vla_steps"])
@@ -43,14 +47,15 @@ ACTIONS_PER_CHUNK = int(CONFIG["molmo"]["actions_per_chunk"])
 ACTION_RATE_HZ = float(CONFIG["molmo"]["action_rate_hz"])
 ACTION_DT = 1.0 / ACTION_RATE_HZ
 
+MAX_MODEL_WAYPOINT_DELTA = float(CONFIG["molmo"]["max_model_waypoint_delta"])
+MAX_INITIAL_TARGET_OFFSET = float(CONFIG["molmo"]["max_initial_target_offset"])
+
 ENABLE_GRIPPER = bool(CONFIG["gripper"]["enabled"])
 GRIPPER_SPEED = int(CONFIG["gripper"]["speed"])
 GRIPPER_FORCE = int(CONFIG["gripper"]["force"])
+GRIPPER_CLOSE_THRESHOLD = float(CONFIG["gripper"]["close_threshold"])
 
 DRY_RUN = bool(CONFIG["runtime"]["dry_run"])
-MAX_INITIAL_TARGET_OFFSET = float(
-    CONFIG["molmo"]["max_initial_target_offset"]
-)
 
 
 # ============================================================
@@ -61,16 +66,14 @@ def create_experiment_dir():
     os.makedirs(EXPERIMENT_ROOT, exist_ok=True)
 
     iteration = 1
-    while True:
-        experiment_dir = os.path.join(EXPERIMENT_ROOT, f"iteration_{iteration}")
-        if not os.path.exists(experiment_dir):
-            break
+    while os.path.exists(os.path.join(EXPERIMENT_ROOT, f"iteration_{iteration}")):
         iteration += 1
 
+    experiment_dir = os.path.join(EXPERIMENT_ROOT, f"iteration_{iteration}")
     os.makedirs(os.path.join(experiment_dir, "images"))
     os.makedirs(os.path.join(experiment_dir, "videos"))
-    shutil.copy2(CONFIG_PATH, os.path.join(experiment_dir, "config.yaml"))
 
+    shutil.copy2(CONFIG_PATH, os.path.join(experiment_dir, "config.yaml"))
     return experiment_dir
 
 
@@ -87,146 +90,276 @@ class ModelTrajectoryRejected(RuntimeError):
 # ============================================================
 
 def write_shared_vector(shared_array, version_counter, values):
-    """Publish a 7-D vector using a simple version counter."""
+    """Publish a consistent 7-D vector to shared memory."""
     values = np.asarray(values, dtype=np.float64)
 
     version_counter.value += 1  # odd = write in progress
-    for joint_index in range(7):
-        shared_array[joint_index] = float(values[joint_index])
+    for i in range(7):
+        shared_array[i] = float(values[i])
     version_counter.value += 1  # even = complete
 
 
 def read_shared_vector(shared_array, version_counter):
     """Read a consistent shared-memory snapshot."""
     while True:
-        version_before = version_counter.value
-        if version_before % 2:
+        before = version_counter.value
+
+        if before % 2:
             continue
 
         values = np.array([shared_array[i] for i in range(7)], dtype=np.float64)
-        version_after = version_counter.value
+        after = version_counter.value
 
-        if version_before == version_after and version_after % 2 == 0:
+        if before == after and after % 2 == 0:
             return values
 
 
-def read_shared_vector_if_updated(shared_array, version_counter, previous_version, previous_values):
-    """Return a new vector only if a complete newer value has been published."""
+def read_shared_vector_if_updated(
+    shared_array,
+    version_counter,
+    previous_version,
+    previous_values,
+):
+    """Read the target only when a complete newer value was published."""
     current_version = version_counter.value
 
     if current_version == previous_version or current_version % 2:
-        return previous_values, previous_version, False
+        return previous_values, previous_version
 
     values = np.array([shared_array[i] for i in range(7)], dtype=np.float64)
     version_after = version_counter.value
 
     if current_version == version_after and version_after % 2 == 0:
-        return values, version_after, True
+        return values, version_after
 
-    return previous_values, previous_version, False
+    return previous_values, previous_version
 
 
 # ============================================================
 # CONTROL PERIOD
 # ============================================================
 
-def control_period_seconds(control_period):
+def get_dt_seconds(control_period):
     """Convert pylibfranka control period to seconds."""
     try:
-        return float(control_period.to_sec())
+        dt = float(control_period)
+        if np.isfinite(dt) and 0.0001 <= dt <= 0.01:
+            return dt
     except Exception:
-        return 0.001  # Franka nominal control period
+        pass
+
+    try:
+        dt = float(control_period.to_sec())
+        if np.isfinite(dt) and 0.0001 <= dt <= 0.01:
+            return dt
+    except Exception:
+        pass
+
+    return 0.001
 
 
 # ============================================================
-# FRANKA PROCESS
+# SMOOTH STOP
+# ============================================================
+
+def smoothly_stop_control(control, cmd_q, cmd_vel, cmd_acc):
+    """Decelerate the commanded trajectory to zero without time constants."""
+    while True:
+        _, control_period = control.readOnce()
+        dt = get_dt_seconds(control_period)
+
+        # Acceleration required to bring the current velocity toward zero.
+        stop_acc = np.clip(-cmd_vel / max(dt, 1e-6), -MAX_JOINT_ACCELERATION, MAX_JOINT_ACCELERATION)
+
+        # Limit acceleration change per cycle so commanded jerk stays bounded.
+        cmd_acc += np.clip(stop_acc - cmd_acc, -MAX_JOINT_JERK * dt, MAX_JOINT_JERK * dt)
+        cmd_acc = np.clip(cmd_acc, -MAX_JOINT_ACCELERATION, MAX_JOINT_ACCELERATION)
+
+        old_vel = cmd_vel.copy()
+        cmd_vel = np.clip(cmd_vel + cmd_acc * dt, -MAX_JOINT_VELOCITY, MAX_JOINT_VELOCITY)
+
+        # Stop at zero rather than allowing the deceleration step to reverse direction.
+        crossed_zero = old_vel * cmd_vel <= 0.0
+        cmd_vel[crossed_zero] = 0.0
+        cmd_acc[crossed_zero] = 0.0
+        cmd_q += cmd_vel * dt
+
+        if np.max(np.abs(cmd_vel)) < 0.001 and np.max(np.abs(cmd_acc)) < 0.01:
+            final_command = JointPositions(cmd_q.tolist())
+            final_command.motion_finished = True
+            control.writeOnce(final_command)
+            return
+
+        control.writeOnce(JointPositions(cmd_q.tolist()))
+
+
+# ============================================================
+# FRANKA CONTROL PROCESS
 # ============================================================
 
 def franka_control_process(
-    shared_target, target_version,
-    shared_state, state_version,
-    state_ready, stop_event, error_queue,
+    shared_target,
+    target_version,
+    shared_state,
+    state_version,
+    state_ready,
+    stop_event,
+    error_queue,
 ):
+    """
+    High-rate Franka process.
+
+    Molmo only updates target_q.
+    cmd_q / cmd_vel / cmd_acc remain continuous and smoothly follow
+    the latest target while respecting configured velocity,
+    acceleration and jerk limits.
+    """
+
     robot = None
+    control = None
 
     try:
-        print(f"Connecting Franka to {ROBOT_IP}...", flush=True)
+        print(f"Connecting Franka control process to {ROBOT_IP}...", flush=True)
 
         robot = Robot(ROBOT_IP, RealtimeConfig.kIgnore)
-        control = robot.start_joint_position_control(ControllerMode.JointImpedance)
 
-        robot_state, _ = control.readOnce()
-        measured_q = np.asarray(robot_state.q, dtype=np.float64)
-
-        # Start command exactly from the measured configuration.
-        command_q = measured_q.copy()
-        start_q = command_q.copy()
-        target_q = command_q.copy()
-
-        target_elapsed = ACTION_DT
-        last_target_version = target_version.value
-
-        write_shared_vector(shared_state, state_version, measured_q)
-        control.writeOnce(JointPositions(command_q.tolist()))
-
-        state_ready.set()
-        print("Franka control process ready.", flush=True)
-
+        # Outer loop exists so a fresh control session can be created
+        # after a recoverable Franka reflex.
         while not stop_event.is_set():
-            robot_state, control_period = control.readOnce()
-            dt = control_period_seconds(control_period)
+            try:
+                control = robot.start_joint_position_control(
+                    ControllerMode.JointImpedance
+                )
 
-            measured_q = np.asarray(robot_state.q, dtype=np.float64)
-            write_shared_vector(shared_state, state_version, measured_q)
+                # Start from the actual physical robot position at rest.
+                robot_state, _ = control.readOnce()
+                measured_q = np.asarray(robot_state.q, dtype=np.float64)
 
-            new_target, last_target_version, target_updated = read_shared_vector_if_updated(
-                shared_target,
-                target_version,
-                last_target_version,
-                target_q,
-            )
+                cmd_q = measured_q.copy()
+                cmd_vel = np.zeros(7, dtype=np.float64)
+                cmd_acc = np.zeros(7, dtype=np.float64)
 
-            if target_updated:
-                # Interpolate from the currently commanded pose to the new Molmo waypoint.
-                start_q = command_q.copy()
-                target_q = new_target.copy()
-                target_elapsed = 0.0
+                target_q = measured_q.copy()
+                last_target_version = target_version.value
 
-                if np.any(target_q < JOINT_LOWER_LIMIT) or np.any(target_q > JOINT_UPPER_LIMIT):
-                    raise RuntimeError("Target exceeds Franka joint limits.")
+                write_shared_vector(shared_state, state_version, measured_q)
+                control.writeOnce(JointPositions(cmd_q.tolist()))
 
+                state_ready.set()
+                print("Franka control process ready.", flush=True)
 
-            # Molmo gives waypoints at 15 Hz; interpolate between them at the Franka control rate.
-            if target_elapsed < ACTION_DT:
-                target_elapsed += dt
-                interpolation = min(target_elapsed / ACTION_DT, 1.0)
-                command_q = start_q + interpolation * (target_q - start_q)
-            else:
-                command_q = target_q.copy()
+                # ------------------------------------------------
+                # HIGH-RATE CONTROL LOOP
+                # ------------------------------------------------
 
-            if np.any(command_q < JOINT_LOWER_LIMIT) or np.any(command_q > JOINT_UPPER_LIMIT):
-                raise RuntimeError("Generated command exceeds Franka joint limits.")
+                while not stop_event.is_set():
+                    robot_state, control_period = control.readOnce()
+                    dt = get_dt_seconds(control_period)
 
-            control.writeOnce(JointPositions(command_q.tolist()))
+                    measured_q = np.asarray(robot_state.q, dtype=np.float64)
+                    write_shared_vector(shared_state, state_version, measured_q)
 
-        # Mark the final position command as finished.
-        final_command = JointPositions(command_q.tolist())
-        final_command.motion_finished = True
-        control.writeOnce(final_command)
+                    # Only the target changes when Molmo publishes another action.
+                    target_q, last_target_version = read_shared_vector_if_updated(
+                        shared_target,
+                        target_version,
+                        last_target_version,
+                        target_q,
+                    )
 
-    except Exception as exception:
-        error_text = (
-            f"Franka control error:\n"
-            f"{repr(exception)}\n"
-            f"{traceback.format_exc()}"
-        )
+                    # Distance and direction to the latest Molmo target.
+                    error = target_q - cmd_q
+                    direction = np.sign(error)
 
-        try:
-            error_queue.put_nowait(error_text)
-        except Exception:
-            pass
+                    # Largest velocity that can still stop at the target:
+                    # v^2 = 2*a*distance. This replaces POSITION_TIME_CONSTANT.
+                    stopping_vel = np.sqrt(2.0 * MAX_JOINT_ACCELERATION * np.abs(error))
+                    desired_vel = direction * np.minimum(MAX_JOINT_VELOCITY, stopping_vel)
 
-        stop_event.set()
+                    # Acceleration required to approach desired velocity directly.
+                    # No VELOCITY_TIME_CONSTANT is used.
+                    desired_acc = np.clip(
+                        (desired_vel - cmd_vel) / max(dt, 1e-6),
+                        -MAX_JOINT_ACCELERATION,
+                        MAX_JOINT_ACCELERATION,
+                    )
+
+                    # Bound acceleration change per cycle -> jerk limiting.
+                    cmd_acc += np.clip(
+                        desired_acc - cmd_acc,
+                        -MAX_JOINT_JERK * dt,
+                        MAX_JOINT_JERK * dt,
+                    )
+                    cmd_acc = np.clip(cmd_acc, -MAX_JOINT_ACCELERATION, MAX_JOINT_ACCELERATION)
+
+                    # Integrate acceleration -> velocity, while respecting both the
+                    # configured velocity bound and the target stopping velocity.
+                    next_vel = np.clip(cmd_vel + cmd_acc * dt, -MAX_JOINT_VELOCITY, MAX_JOINT_VELOCITY)
+                    next_vel = np.clip(next_vel, -stopping_vel, stopping_vel)
+                    next_q = cmd_q + next_vel * dt
+
+                    # Do not step through the current Molmo target.
+                    crossed_target = (((error >= 0.0) & (next_q >= target_q)) |
+                                      ((error < 0.0) & (next_q <= target_q)))
+                    next_q[crossed_target] = target_q[crossed_target]
+                    next_vel[crossed_target] = 0.0
+                    cmd_acc[crossed_target] = 0.0
+                    cmd_q, cmd_vel = next_q, next_vel
+
+                    if np.any(cmd_q < JOINT_LOWER_LIMIT) or np.any(cmd_q > JOINT_UPPER_LIMIT):
+                        raise RuntimeError(
+                            "Generated trajectory exceeded Franka joint limits."
+                        )
+
+                    control.writeOnce(JointPositions(cmd_q.tolist()))
+
+                # Normal program shutdown.
+                smoothly_stop_control(control, cmd_q, cmd_vel, cmd_acc)
+
+            except Exception as exception:
+                if stop_event.is_set():
+                    break
+
+                print(f"\nFranka control error: {exception}", flush=True)
+
+                # Stop the failed control session.
+                try:
+                    robot.stop()
+                except Exception:
+                    pass
+
+                # IMPORTANT:
+                # Release the old ActiveControl object before creating another
+                # control session. Otherwise libfranka reports:
+                # "another control or read operation is running".
+                if control is not None:
+                    try:
+                        del control
+                    except Exception:
+                        pass
+                    control = None
+
+                print("Attempting automatic error recovery...", flush=True)
+
+                try:
+                    robot.automatic_error_recovery()
+                    print("Franka automatic error recovery succeeded.", flush=True)
+                    time.sleep(0.5)
+
+                except Exception as recovery_exception:
+                    error_text = (
+                        f"Franka recovery failed:\n"
+                        f"{repr(recovery_exception)}\n"
+                        f"{traceback.format_exc()}"
+                    )
+
+                    try:
+                        error_queue.put_nowait(error_text)
+                    except Exception:
+                        pass
+
+                    stop_event.set()
+                    break
 
     finally:
         if robot is not None:
@@ -237,15 +370,19 @@ def franka_control_process(
 
 
 # ============================================================
-# MAIN VLA CONTROLLER
+# VLA CONTROLLER
 # ============================================================
 
 class VLAController:
+
     def __init__(
         self,
-        shared_target, target_version,
-        shared_state, state_version,
-        stop_event, error_queue,
+        shared_target,
+        target_version,
+        shared_state,
+        state_version,
+        stop_event,
+        error_queue,
         experiment_dir,
     ):
         self.shared_target = shared_target
@@ -261,6 +398,7 @@ class VLAController:
         self.log_path = os.path.join(experiment_dir, "robot_run.txt")
 
         print(f"Experiment directory: {self.experiment_dir}")
+        print(f"Robot log file: {self.log_path}")
 
         print("Connecting to Robotiq gripper...")
         self.gripper = RobotiqGripper()
@@ -271,7 +409,7 @@ class VLAController:
         self.cameras = DualZEDCameras()
         print("Cameras ready.")
 
-        self.video_fps = 5.0
+        self.video_fps = 2.0
         self.side_video_writer = None
         self.wrist_video_writer = None
 
@@ -290,13 +428,12 @@ class VLAController:
         writer_attr = f"{camera_name}_video_writer"
         writer = getattr(self, writer_attr, None)
 
-        # Create the writer on the first frame so the real image size is known.
         if writer is None:
             height, width = rgb_frame.shape[:2]
-            output_path = os.path.join(self.video_dir, f"{camera_name}_trajectory.mp4")
+            path = os.path.join(self.video_dir, f"{camera_name}_trajectory.mp4")
 
             writer = cv2.VideoWriter(
-                output_path,
+                path,
                 cv2.VideoWriter_fourcc(*"mp4v"),
                 self.video_fps,
                 (width, height),
@@ -304,15 +441,16 @@ class VLAController:
             )
 
             if not writer.isOpened():
-                raise RuntimeError(f"Failed to open video writer: {output_path}")
+                raise RuntimeError(f"Failed to open video writer: {path}")
 
             setattr(self, writer_attr, writer)
 
-        bgr_frame = cv2.cvtColor(
-            np.asarray(rgb_frame, dtype=np.uint8),
-            cv2.COLOR_RGB2BGR,
+        writer.write(
+            cv2.cvtColor(
+                np.asarray(rgb_frame, dtype=np.uint8),
+                cv2.COLOR_RGB2BGR,
+            )
         )
-        writer.write(bgr_frame)
 
 
     # ========================================================
@@ -320,8 +458,8 @@ class VLAController:
     # ========================================================
 
     def write_log(self, text):
-        with open(self.log_path, "a", encoding="utf-8") as log_file:
-            log_file.write(text + "\n")
+        with open(self.log_path, "a", encoding="utf-8") as file:
+            file.write(text + "\n")
 
 
     # ========================================================
@@ -336,13 +474,12 @@ class VLAController:
 
 
     def get_model_state(self):
-        joint_pos = self.get_joint_state()
-        gripper_pos = self.gripper.get_raw_position()
+        joint_q = self.get_joint_state()
+        gripper_position = self.gripper.get_raw_position()
 
-        # Molmo DROID state = 7 Franka joints + 1 gripper value.
         return np.concatenate([
-            joint_pos,
-            np.array([gripper_pos], dtype=np.float32),
+            joint_q,
+            np.array([gripper_position], dtype=np.float32),
         ])
 
 
@@ -376,30 +513,32 @@ class VLAController:
 
 
     # ========================================================
-    # TARGET
+    # FRANKA TARGET
     # ========================================================
 
-    def set_joint_target(self, target_joint_pos):
-        target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
+    def set_joint_target(self, target_q):
+        target_q = np.asarray(target_q, dtype=np.float64)
 
-        if target_joint_pos.shape != (7,):
-            raise ValueError(f"Expected joint target shape (7,), got {target_joint_pos.shape}")
+        if target_q.shape != (7,):
+            raise ValueError(f"Expected joint target shape (7,), got {target_q.shape}")
 
-        if not np.all(np.isfinite(target_joint_pos)):
+        if not np.all(np.isfinite(target_q)):
             raise ValueError("Joint target contains NaN or Inf.")
 
-        if np.any(target_joint_pos < JOINT_LOWER_LIMIT) or np.any(target_joint_pos > JOINT_UPPER_LIMIT):
-            raise ModelTrajectoryRejected("Molmo target exceeds Franka joint limits.")
+        if np.any(target_q < JOINT_LOWER_LIMIT) or np.any(target_q > JOINT_UPPER_LIMIT):
+            raise ModelTrajectoryRejected(
+                "Molmo joint target is outside Franka joint limits."
+            )
 
         write_shared_vector(
             self.shared_target,
             self.target_version,
-            target_joint_pos,
+            target_q,
         )
 
 
     # ========================================================
-    # MODEL OUTPUT VALIDATION
+    # MODEL TRAJECTORY VALIDATION
     # ========================================================
 
     def validate_action_trajectory(self, predicted_actions):
@@ -416,39 +555,36 @@ class VLAController:
         predicted_q = predicted_actions[:, :7].astype(np.float64)
         current_q = self.get_joint_state().astype(np.float64)
 
-        # Hard robot-position-limit check.
         if np.any(predicted_q < JOINT_LOWER_LIMIT) or np.any(predicted_q > JOINT_UPPER_LIMIT):
             raise ModelTrajectoryRejected(
                 "Molmo trajectory contains a target outside Franka joint limits."
             )
 
-        # First predicted absolute pose should not be excessively far from
-        # the robot's actual current configuration.
         initial_delta = predicted_q[0] - current_q
         max_initial_offset = float(np.max(np.abs(initial_delta)))
 
-        # Diagnostic: implied velocities between Molmo's 15 Hz waypoints.
         if len(predicted_q) > 1:
             waypoint_delta = np.diff(predicted_q, axis=0)
-            implied_velocity = np.abs(waypoint_delta) / ACTION_DT
-            max_velocity_ratio = np.max(implied_velocity / JOINT_VELOCITY_LIMIT)
+            max_waypoint_delta = float(np.max(np.abs(waypoint_delta)))
         else:
-            waypoint_delta = np.empty((0, 7))
-            max_velocity_ratio = 0.0
+            max_waypoint_delta = 0.0
 
         print(f"Current q:          {np.array2string(current_q, precision=4)}")
         print(f"Molmo first q:      {np.array2string(predicted_q[0], precision=4)}")
         print(f"Initial delta:      {np.array2string(initial_delta, precision=4)}")
         print(f"Max initial offset: {max_initial_offset:.4f} rad")
-
-        if len(waypoint_delta):
-            print(f"Max waypoint delta: {np.max(np.abs(waypoint_delta)):.4f} rad")
-            print(f"Max velocity ratio: {max_velocity_ratio:.2f}x robot limit")
+        print(f"Max waypoint delta: {max_waypoint_delta:.4f} rad")
 
         if max_initial_offset > MAX_INITIAL_TARGET_OFFSET:
             raise ModelTrajectoryRejected(
-                f"Initial Molmo target offset {max_initial_offset:.4f} rad exceeds "
+                f"Initial target offset {max_initial_offset:.4f} rad exceeds "
                 f"{MAX_INITIAL_TARGET_OFFSET:.4f} rad."
+            )
+
+        if max_waypoint_delta > MAX_MODEL_WAYPOINT_DELTA:
+            raise ModelTrajectoryRejected(
+                f"Waypoint delta {max_waypoint_delta:.4f} rad exceeds "
+                f"{MAX_MODEL_WAYPOINT_DELTA:.4f} rad."
             )
 
         return predicted_actions
@@ -462,10 +598,16 @@ class VLAController:
         if not ENABLE_GRIPPER:
             return
 
-        normalized_value = float(np.clip(gripper_value, 0.0, 1.0))
-        robotiq_position = int(round(normalized_value * 255.0))
+        value = float(np.clip(gripper_value, 0.0, 1.0))
 
-        print(f"Gripper: model={gripper_value:.4f} -> Robotiq={robotiq_position}")
+    
+
+        robotiq_position = int(round(np.clip(value, 0.0, 1.0) * 255.0))
+
+        print(
+            f"Gripper: model={gripper_value:.4f} "
+            f"-> Robotiq={robotiq_position}"
+        )
 
         self.gripper.set_position(
             robotiq_position,
@@ -491,10 +633,10 @@ class VLAController:
 
         self.current_vla_state = robot_state.copy()
 
-        # Save exactly the images passed to Molmo for this inference step.
         Image.fromarray(side_rgb.astype(np.uint8)).save(
             os.path.join(self.image_dir, f"step_{vla_step:03d}_side.png")
         )
+
         Image.fromarray(wrist_rgb.astype(np.uint8)).save(
             os.path.join(self.image_dir, f"step_{vla_step:03d}_wrist.png")
         )
@@ -508,12 +650,15 @@ class VLAController:
             robot_state=robot_state,
         )
 
-        wall_time_ms = (time.perf_counter() - inference_start) * 1000.0
+        wall_ms = (time.perf_counter() - inference_start) * 1000.0
 
         if inference_ms is not None:
-            print(f"Inference: server={inference_ms:.1f} ms, wall={wall_time_ms:.1f} ms")
+            print(
+                f"Inference: server={inference_ms:.1f} ms, "
+                f"wall={wall_ms:.1f} ms"
+            )
         else:
-            print(f"Inference wall time: {wall_time_ms:.1f} ms")
+            print(f"Inference wall time: {wall_ms:.1f} ms")
 
         return self.validate_action_trajectory(predicted_actions)
 
@@ -523,48 +668,69 @@ class VLAController:
     # ========================================================
 
     def execute_action_chunk(self, predicted_actions, vla_step):
+        """
+        Execute Molmo's chunk at the configured policy rate.
+
+        Important:
+        - Do NOT wait for every waypoint to physically settle.
+        - Franka continuously follows the streamed joint targets.
+        - Arm and gripper commands are issued in the same policy step.
+        """
+
         action_count = min(ACTIONS_PER_CHUNK, len(predicted_actions))
-        print(f"Executing {action_count}/{len(predicted_actions)} Molmo actions...")
+
+        print(
+            f"Executing {action_count}/{len(predicted_actions)} "
+            f"Molmo actions..."
+        )
 
         executed_actions = []
-
-        # Absolute scheduling prevents timing drift across the 15-action chunk.
         next_action_time = time.perf_counter()
 
         for action_index in range(action_count):
             self.check_franka_error()
 
-            target_joint_pos = np.asarray(
+            target_q = np.asarray(
                 predicted_actions[action_index, :7],
                 dtype=np.float64,
             )
+
             gripper_value = float(predicted_actions[action_index, 7])
 
-            complete_action = np.concatenate([
-                target_joint_pos,
+            full_action = np.concatenate([
+                target_q,
                 np.array([gripper_value], dtype=np.float64),
             ])
 
             print(
                 f"Action {action_index + 1}/{action_count}: "
-                f"{np.array2string(complete_action, precision=6)}"
+                f"{np.array2string(full_action, precision=6)}"
             )
 
             if not DRY_RUN:
-                # Arm and gripper are commanded during the same policy step.
-                self.set_joint_target(target_joint_pos)
+                # Publish both arm and gripper commands in the same action step.
+                #
+                # The Franka control process smooths the arm target internally;
+                # therefore we do not block here waiting for every waypoint.
+                self.set_joint_target(target_q)
                 self.execute_gripper_action(gripper_value)
-                executed_actions.append(complete_action.copy())
 
+                executed_actions.append(full_action.copy())
+
+            # Keep the policy action stream at the configured 15 Hz.
             next_action_time += ACTION_DT
             sleep_time = next_action_time - time.perf_counter()
 
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-        # Store the state sent to Molmo and all actions actually executed.
+        # ----------------------------------------------------
+        # EXPERIMENT LOG
+        # ----------------------------------------------------
+
         self.write_log("=" * 80)
         self.write_log(f"VLA STEP = {vla_step}")
+
         self.write_log(
             "Robot current state = "
             + np.array2string(
@@ -574,7 +740,9 @@ class VLAController:
             )
         )
 
-        self.write_log(f"Executed actions for this {action_count}-action chunk =")
+        self.write_log(
+            f"Executed actions for this {action_count}-action chunk ="
+        )
 
         if executed_actions:
             self.write_log(
@@ -582,6 +750,7 @@ class VLAController:
                     np.asarray(executed_actions, dtype=np.float64),
                     precision=6,
                     separator=", ",
+                    suppress_small=False,
                 )
             )
         else:
@@ -604,7 +773,11 @@ class VLAController:
         print(f"Instruction: {INSTRUCTION}")
         print(f"Actions per chunk: {ACTIONS_PER_CHUNK}")
         print(f"Policy action rate: {ACTION_RATE_HZ:.1f} Hz")
+        print(f"Max velocity: {MAX_JOINT_VELOCITY[0]:.3f} rad/s")
+        print(f"Max acceleration: {MAX_JOINT_ACCELERATION[0]:.3f} rad/s^2")
+        print(f"Max jerk: {MAX_JOINT_JERK[0]:.3f} rad/s^3")
         print(f"Dry run: {DRY_RUN}")
+        print(f"Saving experiment to: {self.experiment_dir}")
 
         for vla_step in range(1, MAX_VLA_STEPS + 1):
             self.check_franka_error()
@@ -612,13 +785,17 @@ class VLAController:
 
             try:
                 predicted_actions = self.infer(vla_step)
+
             except ModelTrajectoryRejected as exception:
                 print(f"Skipping VLA step {vla_step}: {exception}")
                 continue
 
             self.execute_action_chunk(predicted_actions, vla_step)
 
-            print(f"VLA step time: {time.perf_counter() - step_start:.3f} s")
+            print(
+                f"VLA step time: "
+                f"{time.perf_counter() - step_start:.3f} s"
+            )
 
 
     # ========================================================
@@ -653,7 +830,6 @@ class VLAController:
 # ============================================================
 
 def main():
-    # Spawn avoids inheriting potentially unsafe robot/camera resources.
     mp.set_start_method("spawn", force=True)
 
     experiment_dir = create_experiment_dir()
@@ -691,6 +867,7 @@ def main():
     )
 
     franka_process.start()
+
     print("Waiting for Franka control process...")
 
     if not state_ready.wait(timeout=10.0):
@@ -701,7 +878,11 @@ def main():
             franka_process.terminate()
             franka_process.join(timeout=2.0)
 
-        raise RuntimeError("Franka control process did not initialize.")
+        raise RuntimeError(
+            "Franka control process did not initialize."
+        )
+
+    print("Franka control process initialized.")
 
     controller = None
 
@@ -718,9 +899,12 @@ def main():
 
         print()
         print("WARNING: robot motion is enabled.")
-        print("Keep the Franka user-stop available and verify that the workspace is clear.")
+        print(
+            "Keep the Franka user-stop available "
+            "and verify that the workspace is clear."
+        )
 
-        input("Press Enter to start MolmoAct2 control...")
+
         controller.run()
 
     except KeyboardInterrupt:
@@ -741,7 +925,11 @@ def main():
         franka_process.join(timeout=5.0)
 
         if franka_process.is_alive():
-            print("Franka process did not stop normally. Terminating it.")
+            print(
+                "Franka process did not stop normally. "
+                "Terminating it."
+            )
+
             franka_process.terminate()
             franka_process.join(timeout=2.0)
 
