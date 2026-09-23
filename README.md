@@ -1,21 +1,4 @@
-# MolmoAct2 Franka Controller
 
-This repository connects the **MolmoAct2-DROID** vision-language-action model to a Franka robot equipped with a Robotiq 2F-85 gripper and two ZED cameras. The model runs behind an HTTP inference server; the robot controller captures observations, requests an action trajectory, validates it, and executes a configurable part of the trajectory in a closed loop.
-
-
-
-## System overview
-
-The controller sends the following observation to `POST /act`:
-
-- external/side camera image: RGB `uint8`
-- wrist camera image: RGB `uint8`
-- natural-language task instruction
-- robot state: eight `float32` values (`q1..q7` plus gripper position)
-
-The server returns an `N x 8` action array containing seven absolute Franka joint targets and one normalized gripper command. Before execution, the controller rejects non-finite actions, joint-limit violations, large initial offsets, and large waypoint jumps.
-
-During a run, the Franka control loop runs in a separate process. The main process repeatedly captures observations, performs MolmoAct2 inference, and executes up to `actions_per_chunk` actions at `action_rate_hz`.
 
 ## Repository layout
 
